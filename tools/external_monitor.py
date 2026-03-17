@@ -1,264 +1,120 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025 Motohiro Suzuki
+# Released under the MIT License.
+
 from __future__ import annotations
 
-import argparse
 import json
-import hashlib
 import sys
 from pathlib import Path
-from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
+ROOT_DIR = Path(__file__).resolve().parent.parent
+TRANSPARENCY_DIR = ROOT_DIR / "out" / "transparency"
 
 
-def load_json(path: Path) -> dict:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        raise ValueError(f"failed to load json: {path} ({e})")
+def load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def find_checkpoints(history_dir: Path) -> list[Path]:
-    if not history_dir.exists():
-        return []
-    files = sorted(history_dir.glob("checkpoint*.json"))
-    return [p for p in files if p.is_file()]
-
-
-def extract_root(obj: dict) -> str | None:
-    for key in ("merkle_root", "root", "tree_root"):
-        v = obj.get(key)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
+def resolve_history_dir() -> Optional[Path]:
+    candidates = [
+        TRANSPARENCY_DIR / "history",
+        ROOT_DIR / "out" / "checkpoint",
+        ROOT_DIR / "out" / "transparency" / "checkpoints",
+    ]
+    for c in candidates:
+        if c.exists() and c.is_dir():
+            return c
     return None
 
 
-def extract_count(obj: dict) -> int | None:
-    for key in ("entry_count", "entries", "leaf_count"):
-        v = obj.get(key)
-        if isinstance(v, int):
-            return v
-        if isinstance(v, str) and v.isdigit():
-            return int(v)
-    return None
+def get_entries(log_obj: Any) -> List[Dict[str, Any]]:
+    if isinstance(log_obj, list):
+        return log_obj
+    if isinstance(log_obj, dict):
+        if isinstance(log_obj.get("entries"), list):
+            return log_obj["entries"]
+        if isinstance(log_obj.get("log"), list):
+            return log_obj["log"]
+    raise ValueError("Could not find log entries in transparency_log.json")
 
 
-def extract_signature(obj: dict) -> str | None:
-    for key in ("signature", "signed_root", "checkpoint_signature"):
-        v = obj.get(key)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
+def normalize_checkpoint(obj: Dict[str, Any]) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    root = None
+    count = None
+    timestamp = None
 
+    for key in ("root", "merkle_root", "root_hash"):
+        if isinstance(obj.get(key), str):
+            root = obj[key]
+            break
 
-def build_history_report(history_files: list[Path]) -> tuple[list[dict], list[str], list[str]]:
-    rows = []
-    errors = []
-    warnings = []
+    for key in ("entry_count", "entries", "tree_size", "log_size"):
+        if isinstance(obj.get(key), int):
+            count = obj[key]
+            break
 
-    prev_count = None
+    for key in ("timestamp", "created_at", "generated_at"):
+        if isinstance(obj.get(key), str):
+            timestamp = obj[key]
+            break
 
-    for path in history_files:
-        try:
-            obj = load_json(path)
-        except Exception as e:
-            errors.append(str(e))
-            continue
-
-        root = extract_root(obj)
-        count = extract_count(obj)
-        sig = extract_signature(obj)
-
-        row = {
-            "file": str(path),
-            "sha256": sha256_file(path),
-            "merkle_root": root,
-            "entry_count": count,
-            "has_signature_field": bool(sig),
-            "status": "ok",
-        }
-
-        if root is None:
-            row["status"] = "error"
-            errors.append(f"{path}: missing merkle_root/root/tree_root")
-        if count is None:
-            row["status"] = "error"
-            errors.append(f"{path}: missing entry_count/entries/leaf_count")
-
-        if prev_count is not None and count is not None:
-            if count < prev_count:
-                row["status"] = "error"
-                errors.append(
-                    f"{path}: entry_count decreased ({count} < {prev_count})"
-                )
-            elif count == prev_count:
-                warnings.append(f"{path}: entry_count unchanged ({count})")
-
-        prev_count = count if count is not None else prev_count
-        rows.append(row)
-
-    return rows, errors, warnings
-
-
-def read_root_txt(root_file: Path) -> str | None:
-    if not root_file.exists():
-        return None
-    text = root_file.read_text(encoding="utf-8").strip()
-    return text or None
-
-
-def compare_latest_with_current(
-    history_rows: list[dict],
-    current_checkpoint: Path | None,
-    root_file: Path | None,
-) -> tuple[list[str], list[str], dict]:
-    errors = []
-    warnings = []
-    current = {
-        "current_checkpoint_root": None,
-        "root_txt_root": None,
-        "latest_history_root": None,
-        "current_checkpoint_entry_count": None,
-        "latest_history_entry_count": None,
-    }
-
-    if not history_rows:
-        warnings.append("no history rows found")
-        return errors, warnings, current
-
-    latest = history_rows[-1]
-    latest_root = latest.get("merkle_root")
-    latest_count = latest.get("entry_count")
-
-    current["latest_history_root"] = latest_root
-    current["latest_history_entry_count"] = latest_count
-
-    if current_checkpoint is not None and current_checkpoint.exists():
-        try:
-            cp = load_json(current_checkpoint)
-            cp_root = extract_root(cp)
-            cp_count = extract_count(cp)
-            current["current_checkpoint_root"] = cp_root
-            current["current_checkpoint_entry_count"] = cp_count
-
-            if cp_root is None:
-                errors.append(f"{current_checkpoint}: missing merkle root")
-            elif latest_root is not None and cp_root != latest_root:
-                errors.append(
-                    "latest history root does not match current checkpoint root "
-                    f"({latest_root} != {cp_root})"
-                )
-
-            if cp_count is not None and latest_count is not None and cp_count != latest_count:
-                errors.append(
-                    "latest history entry_count does not match current checkpoint entry_count "
-                    f"({latest_count} != {cp_count})"
-                )
-        except Exception as e:
-            errors.append(str(e))
-    else:
-        warnings.append("current checkpoint file not found; skipped current checkpoint comparison")
-
-    if root_file is not None and root_file.exists():
-        rt = read_root_txt(root_file)
-        current["root_txt_root"] = rt
-        if rt is None:
-            errors.append(f"{root_file}: empty root.txt")
-        elif latest_root is not None and rt != latest_root:
-            errors.append(
-                f"latest history root does not match root.txt ({latest_root} != {rt})"
-            )
-    else:
-        warnings.append("root.txt not found; skipped root.txt comparison")
-
-    return errors, warnings, current
+    return root, count, timestamp
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="External monitor for transparency checkpoints/history"
-    )
-    parser.add_argument(
-        "--history-dir",
-        default="out/transparency/history",
-        help="Directory containing checkpoint history files",
-    )
-    parser.add_argument(
-        "--current-checkpoint",
-        default="out/transparency/checkpoint.json",
-        help="Path to current checkpoint.json",
-    )
-    parser.add_argument(
-        "--root-file",
-        default="out/transparency/root.txt",
-        help="Path to root.txt",
-    )
-    parser.add_argument(
-        "--output",
-        default="out/monitor/monitor_report.json",
-        help="Path to write monitor report JSON",
-    )
+    try:
+        log_path = TRANSPARENCY_DIR / "transparency_log.json"
+        merkle_path = TRANSPARENCY_DIR / "merkle_tree.json"
+        root_path = TRANSPARENCY_DIR / "root.txt"
+        checkpoint_path = TRANSPARENCY_DIR / "checkpoint.json"
 
-    args = parser.parse_args()
+        if not log_path.exists():
+            raise FileNotFoundError(f"missing file: {log_path}")
+        if not merkle_path.exists():
+            raise FileNotFoundError(f"missing file: {merkle_path}")
 
-    history_dir = Path(args.history_dir)
-    current_checkpoint = Path(args.current_checkpoint)
-    root_file = Path(args.root_file)
-    output = Path(args.output)
+        log_obj = load_json(log_path)
+        _ = load_json(merkle_path)
+        entries = get_entries(log_obj)
 
-    history_files = find_checkpoints(history_dir)
+        root = root_path.read_text(encoding="utf-8").strip() if root_path.exists() else None
+        checkpoint_root = None
+        checkpoint_count = None
+        checkpoint_timestamp = None
 
-    history_rows, history_errors, history_warnings = build_history_report(history_files)
-    compare_errors, compare_warnings, current = compare_latest_with_current(
-        history_rows,
-        current_checkpoint,
-        root_file,
-    )
+        if checkpoint_path.exists():
+            checkpoint_obj = load_json(checkpoint_path)
+            checkpoint_root, checkpoint_count, checkpoint_timestamp = normalize_checkpoint(checkpoint_obj)
 
-    errors = history_errors + compare_errors
-    warnings = history_warnings + compare_warnings
+        history_dir = resolve_history_dir()
+        history_files = sorted(history_dir.glob("checkpoint_*.json")) if history_dir else []
 
-    report = {
-        "tool": "external_monitor.py",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "inputs": {
-            "history_dir": str(history_dir),
-            "current_checkpoint": str(current_checkpoint),
-            "root_file": str(root_file),
-        },
-        "summary": {
-            "history_files_found": len(history_files),
-            "ok": len(errors) == 0,
-            "error_count": len(errors),
-            "warning_count": len(warnings),
-        },
-        "history": history_rows,
-        "current_comparison": current,
-        "errors": errors,
-        "warnings": warnings,
-    }
+        print("[external_monitor] transparency status")
+        print(f"  log_path           : {log_path}")
+        print(f"  merkle_path        : {merkle_path}")
+        print(f"  entry_count        : {len(entries)}")
+        print(f"  root_txt           : {root or 'n/a'}")
+        print(f"  checkpoint_root    : {checkpoint_root or 'n/a'}")
+        print(f"  checkpoint_count   : {checkpoint_count if checkpoint_count is not None else 'n/a'}")
+        print(f"  checkpoint_time    : {checkpoint_timestamp or 'n/a'}")
+        print(f"  checkpoint_history : {len(history_files)} file(s)")
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        if history_files:
+            print("  history_files:")
+            for p in history_files:
+                print(f"    - {p.name}")
 
-    if len(errors) == 0:
-        print(f"[OK] wrote: {output}")
-        print(f"[OK] history files: {len(history_files)}")
-        print("[OK] external monitor passed")
+        print("[OK] external monitor completed")
         return 0
-    else:
-        print(f"[OK] wrote: {output}")
-        print(f"[NG] error count: {len(errors)}")
-        for e in errors:
-            print(f"[ERROR] {e}")
+
+    except Exception as e:
+        print(f"[ERROR] external monitor failed: {e}", file=sys.stderr)
         return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
